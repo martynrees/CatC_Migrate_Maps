@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Customer map export data must never be committed here (public repo)
+*.tar.gz
+DNAC_Map_Archive*/
+extracted/
+map_export_*/
