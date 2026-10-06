@@ -263,13 +263,16 @@ def wait_for_task(api, task_id, label):
     raise TimeoutError(f"{label} did not complete within {TASK_TIMEOUT_SECONDS}s")
 
 
-def export_site_maps(api, site_uuid, download_dir):
+def export_site_maps(api, base_url, site_uuid, download_dir):
     print(f"\nRequesting map export for site UUID {site_uuid} ...")
-    # The endpoint takes no body, but the SDK's request validator rejects the
-    # empty payload ("data must be string"), so skip client-side validation.
-    resp = api.sites.export_map_archive(
-        site_hierarchy_uuid=site_uuid, active_validation=False
-    ).response
+    # The SDK posts a JSON "{}" body with Content-Type: application/json, which
+    # this endpoint rejects with 415. Send a bare POST (no body, no
+    # Content-Type) instead.
+    url = f"{base_url}/dna/intent/api/v1/maps/export/{site_uuid}"
+    r = requests.post(url, headers=maps_api_headers(api), verify=False, timeout=60)
+    if not r.ok:
+        raise RuntimeError(f"[{r.status_code}] export request failed: {r.text[:500]}")
+    resp = r.json().get("response", {})
     raw_task_id = resp.get("taskId")
     task_id = raw_task_id.get("id") if isinstance(raw_task_id, dict) else raw_task_id
     if not task_id:
@@ -412,6 +415,7 @@ def main():
 
     old_api = connect(old_host, username, password, "old system")
     new_api = connect(new_host, username, password, "new system")
+    old_base_url = f"https://{old_host}"
     new_base_url = f"https://{new_host}"
 
     print("\nFetching site hierarchy from the old system ...")
@@ -449,7 +453,7 @@ def main():
                 print("All buildings/floors matched by name. Proceeding.")
 
             try:
-                archive_path = export_site_maps(old_api, site_uuid, download_dir)
+                archive_path = export_site_maps(old_api, old_base_url, site_uuid, download_dir)
                 imported = import_site_maps(new_api, new_base_url, archive_path)
                 if imported:
                     print(
