@@ -265,7 +265,11 @@ def wait_for_task(api, task_id, label):
 
 def export_site_maps(api, site_uuid, download_dir):
     print(f"\nRequesting map export for site UUID {site_uuid} ...")
-    resp = api.sites.export_map_archive(site_hierarchy_uuid=site_uuid).response
+    # The endpoint takes no body, but the SDK's request validator rejects the
+    # empty payload ("data must be string"), so skip client-side validation.
+    resp = api.sites.export_map_archive(
+        site_hierarchy_uuid=site_uuid, active_validation=False
+    ).response
     raw_task_id = resp.get("taskId")
     task_id = raw_task_id.get("id") if isinstance(raw_task_id, dict) else raw_task_id
     if not task_id:
