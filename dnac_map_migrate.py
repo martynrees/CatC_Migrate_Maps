@@ -92,9 +92,12 @@ def site_hierarchy_name(site):
 
 
 def site_type(site):
-    if not site.get("additionalInfo"):
-        return ""
-    return site["additionalInfo"][0].get("attributes", {}).get("type", "")
+    # additionalInfo order is not guaranteed; scan every entry for the type.
+    for info in site.get("additionalInfo") or []:
+        stype = (info.get("attributes") or {}).get("type")
+        if stype:
+            return stype
+    return ""
 
 
 def site_leaf_name(site):
