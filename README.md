@@ -52,37 +52,37 @@ Then pick a site from the old system's hierarchy, review the name
 cross-check against the new system, confirm the pre-import preview, and
 repeat for the next area as needed.
 
-## Important limitations and assumptions
+## Verified behaviour (tested against a lab Catalyst Center)
 
-This tool was built against Catalyst Center's Map Archive
-export/import APIs, which are only partially documented publicly. A few
-things are **inferred, not confirmed**, and are marked as such directly in
-the code:
+- **Export request:** `POST /maps/export/{id}` answers 415 to every
+  `application/json` request. It accepts `Content-Type: text/plain`; the body
+  is used as the archive file name (plain alphanumerics only). The SDK's
+  `export_map_archive` cannot make this call (its schema is `string`, its
+  default body `{}` is rejected), so the script posts it directly.
+- **Export result:** the finished task has `data: "/file/<fileId>"`; the tar.gz
+  is downloaded with the SDK file API. It contains `xmlDir/MapsImportExport.xml`,
+  `images/*` (floor plans) and `metadata.txt`.
+- **Planned APs** are exported with position and radio settings.
+  `metadata.txt` "Count of APs" counts only real (assigned) APs.
+  Placement of real APs has not been tested.
+- **Import upload:** `POST /maps/import/start` multipart field is `archive`
+  (`file` returns 400).
+- **Matching is by full hierarchy path** stored in the XML as nested
+  `Site > Building > Floor` names (without `Global`), not by leaf name alone.
+- **Import cannot create areas, buildings or floors.** Anything missing on the
+  target is reported "doesn't exist ... will be ignored". Create the target
+  hierarchy (exact names) first.
+- **Remap:** `--remap` rewrites the XML nesting so an exported subtree lands
+  on a different existing path. Preview confirmed on an existing floor;
+  a committed import has not yet been tested.
 
-- **Destination matching is by name, not by ID or path.** Neither the
-  Export Map Archive nor Import Map Archive APIs expose any
-  `siteId`/`domain`/hierarchy parameter, and the exported archive itself
-  does not contain the source system's full hierarchy path as text. The
-  working theory — consistent with everything observed — is that
-  Catalyst Center matches imported buildings/floors to **existing**
-  buildings/floors on the destination system by name. This tool assumes
-  the target buildings and floors already exist on the new system before
-  you run it (create them via the normal Sites workflow first).
-- **The upload field name for Start Import** (`file`) is inferred from
-  the convention used by every other binary-upload endpoint in this API
-  family (software image import, generic file upload), not confirmed
-  against this specific endpoint's request schema.
-- **The file reference produced by the export task** (used to download
-  the resulting tar.gz) is located with a best-effort recursive search for
-  a `fileId`-shaped key in the completed task response, since its exact
-  schema isn't documented either. If it can't be found automatically, the
-  script prints the raw task JSON and lets you paste the file ID in
-  manually.
+```bash
+python3 dnac_map_migrate.py --export-only                    # uses .env
+python3 dnac_map_migrate.py --remap IN.tar.gz "Global/old/path" "Global/new/path" OUT.tar.gz
+python3 dnac_map_migrate.py --import-only OUT.tar.gz         # preview + yes gate
+```
 
-If either of the two inferred points above needs adjusting for your
-Catalyst Center release, the raw server response is always printed on
-failure — check `start_import()` and `export_site_maps()` in
-`dnac_map_migrate.py`.
+Credentials come from a gitignored `.env` (see `.env.example`).
 
 ### 500-map export limit
 

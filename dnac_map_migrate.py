@@ -47,6 +47,22 @@ from dnacentersdk.exceptions import ApiError
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+def load_dotenv(path=None):
+    """Minimal .env loader (KEY=VALUE per line, # comments). Real environment
+    variables win over the file. Keeps credentials out of the repo and out of
+    prompts so the tool can run unattended."""
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
 POLL_INTERVAL_SECONDS = 5
 TASK_TIMEOUT_SECONDS = 900
 
@@ -263,48 +279,118 @@ def wait_for_task(api, task_id, label):
     raise TimeoutError(f"{label} did not complete within {TASK_TIMEOUT_SECONDS}s")
 
 
+# Verified against a lab Catalyst Center: this endpoint answers 415 to every
+# application/json request (and to bare/empty POSTs), but accepts
+# Content-Type: text/plain and returns 202 + taskId. The empty-body case
+# returns 400 NCMP00195. The body is used as the archive's file name
+# (a body of "{}" fails the task with NCFS10055 "{}.tar.gz contains special
+# characters"), so send a plain alphanumeric name.
+def _export_variants(name):
+    return [
+        ("CT text/plain, body = file name",
+         {"Content-Type": "text/plain", "Accept": "application/json"}, name),
+    ]
+
+
+def _save_archive(content, download_dir, site_uuid):
+    filename = f"map_export_{site_uuid}.tar.gz"
+    path = os.path.join(download_dir, filename)
+    with open(path, "wb") as fh:
+        fh.write(content)
+    print(f"Saved export to {path} ({os.path.getsize(path)} bytes)")
+    return path
+
+
+def _download_by_context(base_url, api, context_id, download_dir, site_uuid):
+    # INFERRED: some releases expose GET /maps/export/{id}/download.
+    url = f"{base_url}/dna/intent/api/v1/maps/export/{context_id}/download"
+    r = requests.get(url, headers=maps_api_headers(api), verify=False, timeout=300)
+    if r.ok and r.content:
+        return _save_archive(r.content, download_dir, site_uuid)
+    print(f"  download via {url} -> HTTP {r.status_code}: {r.text[:200]}")
+    return None
+
+
 def export_site_maps(api, base_url, site_uuid, download_dir):
     print(f"\nRequesting map export for site UUID {site_uuid} ...")
-    # The SDK posts a JSON "{}" body with Content-Type: application/json, which
-    # this endpoint rejects with 415. Send a bare POST (no body, no
-    # Content-Type) instead.
     url = f"{base_url}/dna/intent/api/v1/maps/export/{site_uuid}"
-    r = requests.post(url, headers=maps_api_headers(api), verify=False, timeout=60)
-    if not r.ok:
-        raise RuntimeError(f"[{r.status_code}] export request failed: {r.text[:500]}")
-    resp = r.json().get("response", {})
-    raw_task_id = resp.get("taskId")
+    resp = None
+    for label, extra, body in _export_variants(f"mapexport{int(time.time())}"):
+        headers = {**maps_api_headers(api), **extra}
+        r = requests.post(url, headers=headers, data=body, verify=False, timeout=300)
+        print(f"  [{label}] -> HTTP {r.status_code} "
+              f"ct={r.headers.get('Content-Type')!r} len={len(r.content)}")
+        if r.ok:
+            resp = r
+            break
+        print(f"     {r.text[:300]}")
+    if resp is None:
+        raise RuntimeError(
+            "Every export request variant was rejected (see lines above). "
+            "Run probe_export2.py to check the maps service and site type."
+        )
+
+    # Documented: 200/202 with response.taskId + response.url; poll the Task API.
+    try:
+        payload = resp.json()
+    except ValueError:
+        raise RuntimeError(f"Unrecognised export response: {resp.text[:500]}")
+    inner = payload.get("response", payload) if isinstance(payload, dict) else payload
+    raw_task_id = inner.get("taskId") if isinstance(inner, dict) else None
     task_id = raw_task_id.get("id") if isinstance(raw_task_id, dict) else raw_task_id
     if not task_id:
-        raise RuntimeError(f"Unexpected export response, no taskId found: {resp}")
+        print("Unexpected export response, no taskId:")
+        print(json.dumps(payload, indent=2, default=str))
+        raise RuntimeError("Cannot continue without a taskId.")
 
     task = wait_for_task(api, task_id, "map export")
 
-    # INFERRED: the export task's completion payload should reference a
-    # fileId that /dna/intent/api/v1/file/{fileId} can download. The exact
-    # key name is not publicly documented, so we search for the common
-    # variants used elsewhere in the Catalyst Center API.
-    file_id = find_key_recursive(task, {"fileid"})
-    if not file_id:
-        print("\nCould not automatically find a fileId in the completed export task.")
-        print("Full task response for manual inspection:")
-        print(json.dumps(task, indent=2, default=str))
-        file_id = input(
-            "Enter the file ID to download manually (or leave blank to abort): "
-        ).strip()
-        if not file_id:
-            raise RuntimeError("No file ID available, cannot download export archive.")
+    # INFERRED: the task result references a fileId (file API) or an export
+    # context id (maps download route). Try both before asking the operator.
+    # Verified: the finished task carries data="/file/<fileId>".
+    file_id = None
+    data_ref = task.get("data")
+    if isinstance(data_ref, str) and data_ref.startswith("/file/"):
+        file_id = data_ref.rsplit("/", 1)[-1]
+    file_id = file_id or find_key_recursive(task, {"fileid"})
+    if file_id:
+        print(f"Downloading exported archive (file id {file_id}) ...")
+        filename = f"map_export_{site_uuid}.tar.gz"
+        api.file.download_a_file_by_file_id(
+            file_id=file_id, dirpath=download_dir, save_file=True, filename=filename
+        )
+        path = os.path.join(download_dir, filename)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            print(f"Saved export to {path} ({os.path.getsize(path)} bytes)")
+            return path
 
-    print(f"Downloading exported archive (file id {file_id}) ...")
-    filename = f"map_export_{site_uuid}.tar.gz"
-    api.file.download_a_file_by_file_id(
-        file_id=file_id, dirpath=download_dir, save_file=True, filename=filename
-    )
-    path = os.path.join(download_dir, filename)
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        raise RuntimeError(f"Download reported success but {path} is missing/empty.")
-    print(f"Saved export to {path} ({os.path.getsize(path)} bytes)")
-    return path
+    ctx = find_key_recursive(task, {"exportcontextuuid", "contextid", "exportid"})
+    if ctx:
+        path = _download_by_context(base_url, api, ctx, download_dir, site_uuid)
+        if path:
+            return path
+
+    print("\nCould not locate the exported archive automatically. Task response:")
+    print(json.dumps(task, indent=2, default=str))
+    raise RuntimeError("Export task finished but no downloadable file reference found.")
+
+
+def summarise_archive(path):
+    """Show what is inside the archive so the export can be proven (floor
+    plan images, XML) without importing anywhere."""
+    import tarfile
+
+    try:
+        with tarfile.open(path) as tf:
+            names = tf.getnames()
+    except tarfile.TarError as exc:
+        print(f"Archive is not a readable tar: {exc}")
+        return
+    images = [n for n in names if n.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".svg"))]
+    xmls = [n for n in names if n.lower().endswith(".xml")]
+    print(f"Archive contents: {len(names)} entries, {len(xmls)} xml, {len(images)} images")
+    for n in names[:40]:
+        print(f"   {n}")
 
 
 def maps_api_headers(api):
@@ -314,12 +400,10 @@ def maps_api_headers(api):
 def start_import(base_url, headers, archive_path):
     url = f"{base_url}/dna/intent/api/v1/maps/import/start"
     print(f"\nUploading {archive_path} to {url} ...")
-    # INFERRED: multipart field name "file" follows the convention used by
-    # every other binary-upload endpoint in this API (software image
-    # import, generic file upload). Not confirmed against this specific
-    # endpoint's (undocumented) request schema.
+    # Verified on a lab Catalyst Center: the multipart field name is "archive"
+    # ("file", "upload", "fileUpload", "importFile" all return 400; raw bodies 415).
     with open(archive_path, "rb") as fh:
-        files = {"file": (os.path.basename(archive_path), fh, "application/gzip")}
+        files = {"archive": (os.path.basename(archive_path), fh, "application/gzip")}
         resp = requests.post(url, headers=headers, files=files, verify=False, timeout=300)
 
     if resp.status_code not in (200, 202):
@@ -404,7 +488,144 @@ def import_site_maps(new_api, new_base_url, archive_path):
     return True
 
 
+MAPS_XML = "xmlDir/MapsImportExport.xml"
+_NS = "http://importexport.cisco.com/1.0"
+_HIER_TAGS = {f"{{{_NS}}}Site", f"{{{_NS}}}Building", f"{{{_NS}}}Floor"}
+
+
+def _children_named(node, name):
+    return [c for c in node if c.tag in _HIER_TAGS and c.get("name") == name]
+
+
+def _find_path(root, path):
+    node = root.find(f"{{{_NS}}}Maps")
+    for name in path:
+        found = _children_named(node, name)
+        if not found:
+            raise RuntimeError(f"Path element '{name}' not found in archive XML")
+        node = found[0]
+    return node
+
+
+def remap_archive(src, dst, old_path, new_path):
+    """Rewrite the hierarchy nesting in an exported archive so import lands
+    the subtree at old_path under new_path instead. Paths are lists of names
+    WITHOUT the leading 'Global' (as stored in the XML). Missing intermediate
+    areas on the new path are added as Site elements; the last name of
+    new_path renames the moved node."""
+    import copy
+    import io
+    import tarfile
+    import xml.etree.ElementTree as ET
+
+    ET.register_namespace("", _NS)
+    ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
+
+    with tarfile.open(src) as tf:
+        members = [(m, tf.extractfile(m).read() if m.isfile() else None) for m in tf.getmembers()]
+    xml_bytes = next(d for m, d in members if m.name == MAPS_XML)
+    root = ET.fromstring(xml_bytes)
+
+    moved = _find_path(root, old_path)
+    moved_copy = copy.deepcopy(moved)
+    moved_copy.set("name", new_path[-1])
+
+    # remove old chain (prune ancestors left without hierarchy children)
+    chain = [root.find(f"{{{_NS}}}Maps")]
+    for name in old_path:
+        chain.append(_children_named(chain[-1], name)[0])
+    for parent, child in reversed(list(zip(chain, chain[1:]))):
+        parent.remove(child)
+        if any(c.tag in _HIER_TAGS for c in parent):
+            break
+
+    # build/reuse new ancestors, then attach
+    node = root.find(f"{{{_NS}}}Maps")
+    for i, name in enumerate(new_path[:-1]):
+        found = _children_named(node, name)
+        if found:
+            node = found[0]
+        else:
+            # a floor's direct parent must be a Building, anything else an area
+            is_last = i == len(new_path) - 2
+            tag = "Building" if (is_last and moved.tag.endswith("Floor")) else "Site"
+            node = ET.SubElement(node, f"{{{_NS}}}{tag}", {"name": name})
+    node.append(moved_copy)
+
+    out_xml = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+    with tarfile.open(dst, "w:gz") as tf:
+        for member, data in members:
+            if member.name == MAPS_XML:
+                member.size = len(out_xml)
+                tf.addfile(member, io.BytesIO(out_xml))
+            elif data is not None:
+                tf.addfile(member, io.BytesIO(data))
+            else:
+                tf.addfile(member)
+    return dst
+
+
+def _split(path):
+    parts = [p for p in path.strip("/").split("/") if p]
+    if parts and parts[0] == "Global":
+        parts = parts[1:]
+    return parts
+
+
+def import_only():
+    """python3 dnac_map_migrate.py --import-only ARCHIVE  (preview + yes gate)."""
+    load_dotenv()
+    archive = sys.argv[sys.argv.index("--import-only") + 1]
+    host = os.environ.get("DNAC_NEW_HOST") or os.environ.get("DNAC_HOST") or input("Target host/IP: ").strip()
+    user = os.environ.get("DNAC_USER") or input("Username: ").strip()
+    pw = os.environ.get("DNAC_PASS") or getpass.getpass("Password: ")
+    api = connect(host, user, pw, "target system")
+    import_site_maps(api, f"https://{host}", archive)
+
+
+def export_only():
+    load_dotenv()
+    """Lab/proof mode: export from one system, keep the archive locally and
+    list its contents. Credentials may come from DNAC_HOST/DNAC_USER/DNAC_PASS."""
+    host = os.environ.get("DNAC_HOST") or input("Source host/IP: ").strip()
+    user = os.environ.get("DNAC_USER") or input("Username: ").strip()
+    pw = os.environ.get("DNAC_PASS") or getpass.getpass("Password: ")
+    api = connect(host, user, pw, "source system")
+    sites = list_sites(api)
+    if not sites:
+        sys.exit("No sites found.")
+    out_dir = os.path.abspath(os.environ.get("DNAC_OUT", "map_export_out"))
+    os.makedirs(out_dir, exist_ok=True)
+    wanted = os.environ.get("DNAC_SITE", "").strip()
+    while True:
+        if wanted:
+            matches = [x for x in sites if site_hierarchy_name(x) == wanted]
+            if not matches:
+                sys.exit(f"DNAC_SITE '{wanted}' not found on {host}.")
+            chosen = matches[0]
+        else:
+            chosen = choose_site(sites, "Select the site to export:")
+        try:
+            path = export_site_maps(api, f"https://{host}", chosen.get("id"), out_dir)
+            summarise_archive(path)
+        except (RuntimeError, TimeoutError, ApiError, requests.RequestException) as exc:
+            print(f"\nERROR: {exc}")
+        if wanted or not yes_no("\nExport another site?", default_no=True):
+            break
+
+
 def main():
+    load_dotenv()
+    if "--remap" in sys.argv:
+        i = sys.argv.index("--remap")
+        src, old, new, dst = sys.argv[i + 1 : i + 5]
+        remap_archive(src, dst, _split(old), _split(new))
+        print(f"Wrote {dst}: {old} -> {new}")
+        return
+    if "--import-only" in sys.argv:
+        return import_only()
+    if "--export-only" in sys.argv:
+        return export_only()
     print("Catalyst Center map migration tool")
     print("===================================")
 
@@ -454,6 +675,7 @@ def main():
 
             try:
                 archive_path = export_site_maps(old_api, old_base_url, site_uuid, download_dir)
+                summarise_archive(archive_path)
                 imported = import_site_maps(new_api, new_base_url, archive_path)
                 if imported:
                     print(

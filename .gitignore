@@ -7,3 +7,5 @@ __pycache__/
 DNAC_Map_Archive*/
 extracted/
 map_export_*/
+map_export_out/
+.env
