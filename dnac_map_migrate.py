@@ -138,95 +138,54 @@ def choose_site(sites, prompt):
         print("Invalid selection, try again.")
 
 
-def _norm(name):
-    return (name or "").strip().lower()
-
-
 def sites_in_scope(chosen, all_sites):
-    """All sites at or below the chosen node, per the same 'all child
-    elements starting at this hierarchy element' scoping the Export Map
-    Archive API itself uses."""
+    """All sites at or below the chosen node (the same 'all child elements
+    starting at this hierarchy element' scoping the export API uses)."""
     chosen_hierarchy = site_hierarchy_name(chosen)
-    in_scope = []
-    for site in all_sites:
-        hierarchy = site_hierarchy_name(site)
-        if hierarchy == chosen_hierarchy or hierarchy.startswith(chosen_hierarchy + "/"):
-            in_scope.append(site)
-    return in_scope
+    return [
+        site
+        for site in all_sites
+        if site_hierarchy_name(site) == chosen_hierarchy
+        or site_hierarchy_name(site).startswith(chosen_hierarchy + "/")
+    ]
 
 
-def compare_hierarchies(chosen, old_sites, new_sites):
-    """Cross-check building and floor names under the chosen old-system
-    scope against whatever exists anywhere in the new system's hierarchy.
+def check_destination(chosen, dest_root, old_sites, new_sites):
+    """Check, by FULL hierarchy path, that every site under the chosen node
+    will have a counterpart on the new system once the subtree is placed at
+    dest_root. Import matches on the full path and cannot create areas,
+    buildings or floors, so anything missing is silently ignored by import.
+    Returns (report_lines, clean)."""
+    chosen_h = site_hierarchy_name(chosen)
+    new_by_path = {site_hierarchy_name(x): x for x in new_sites}
+    new_lower = {k.lower(): k for k in new_by_path}
+    report, missing, ok = [], 0, 0
+    for site in sorted(sites_in_scope(chosen, old_sites), key=site_hierarchy_name):
+        old_h = site_hierarchy_name(site)
+        dest_h = dest_root + old_h[len(chosen_h):]
+        if dest_h in new_by_path:
+            ok += 1
+            report.append(f"[OK]       {dest_h}")
+        else:
+            missing += 1
+            hint = new_lower.get(dest_h.lower())
+            note = f"  (differs only by case from '{hint}')" if hint else ""
+            report.append(f"[MISSING]  {dest_h}{note}")
+    report.append(f"{ok} found, {missing} missing on the new system.")
+    return report, missing == 0
 
-    This assumes Catalyst Center's map import matches sites by name rather
-    than by a shared ID or path (a working theory, not a documented fact --
-    see the module docstring). Returns (report_lines, clean) where clean is
-    False if anything didn't match cleanly, ambiguously matched more than
-    once, or is missing.
-    """
-    old_scope = sites_in_scope(chosen, old_sites)
-    old_buildings = [s for s in old_scope if site_type(s) == "building"]
-    old_floors = [s for s in old_scope if site_type(s) == "floor"]
 
-    new_buildings_by_name = {}
-    for s in new_sites:
-        if site_type(s) == "building":
-            new_buildings_by_name.setdefault(_norm(site_leaf_name(s)), []).append(s)
-    new_floors_by_parent = {}
-    for s in new_sites:
-        if site_type(s) == "floor":
-            new_floors_by_parent.setdefault(s.get("parentId"), {})[
-                _norm(site_leaf_name(s))
-            ] = s
-
-    report = []
-    clean = True
-
-    if not old_buildings:
-        report.append(
-            f"No buildings found under '{site_hierarchy_name(chosen)}' on the old "
-            "system (selection may itself be a building or floor)."
-        )
-
-    for building in old_buildings:
-        name = site_leaf_name(building)
-        matches = new_buildings_by_name.get(_norm(name), [])
-        floors_here = [
-            f for f in old_floors if f.get("parentId") == building.get("id")
-        ]
-
-        if not matches:
-            clean = False
-            report.append(f"[MISSING]   Building '{name}' -- not found on new system")
-            continue
-        if len(matches) > 1:
-            clean = False
-            paths = ", ".join(site_hierarchy_name(m) for m in matches)
-            report.append(
-                f"[AMBIGUOUS] Building '{name}' -- matches {len(matches)} sites on "
-                f"new system: {paths}"
-            )
-            continue
-
-        new_building = matches[0]
-        report.append(
-            f"[OK]        Building '{name}' -- matched at "
-            f"{site_hierarchy_name(new_building)}"
-        )
-        new_floor_names = new_floors_by_parent.get(new_building.get("id"), {})
-        for floor in floors_here:
-            floor_name = site_leaf_name(floor)
-            if _norm(floor_name) in new_floor_names:
-                report.append(f"            [OK]      Floor '{floor_name}'")
-            else:
-                clean = False
-                report.append(
-                    f"            [MISSING] Floor '{floor_name}' -- not found "
-                    f"under matched building on new system"
-                )
-
-    return report, clean
+def ask(prompt, env_key=None, secret=False, default=None):
+    """Prompt, but take the value from the environment/.env when set."""
+    if env_key and os.environ.get(env_key):
+        shown = "********" if secret else os.environ[env_key]
+        print(f"{prompt} {shown}  (from {env_key})")
+        return os.environ[env_key]
+    if secret:
+        return getpass.getpass(f"{prompt} ")
+    suffix = f" [{default}]" if default else ""
+    value = input(f"{prompt}{suffix}: ").strip()
+    return value or default or ""
 
 
 def yes_no(prompt, default_no=True):
@@ -464,6 +423,39 @@ def cancel_import(base_url, headers, import_context_uuid):
         print("Import cancelled, no changes were made to the new system.")
 
 
+def summarise_preview(status):
+    """Readable import preview: one line per area/building/floor/AP with the
+    server's messages, plus a count of problems."""
+    problems = 0
+
+    def walk(node, depth=0):
+        nonlocal problems
+        if isinstance(node, dict):
+            etype = node.get("entityType")
+            if etype and etype not in ("ROOT", "OBSTACLE_TYPES", "OBSTACLE_TYPE"):
+                msgs = [
+                    (kind, m.get("message"))
+                    for kind in ("errors", "warnings", "infos")
+                    for m in node.get(kind) or []
+                ]
+                flag = "!!" if any(k == "errors" for k, _ in msgs) else "  "
+                problems += sum(1 for k, _ in msgs if k == "errors")
+                print(f"{'  ' * depth}{flag} {etype} {node.get('entityName')}")
+                for kind, msg in msgs:
+                    print(f"{'  ' * depth}     {kind[:-1]}: {msg}")
+            for value in node.values():
+                walk(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, depth)
+
+    walk(status)
+    text = json.dumps(status, default=str).lower()
+    ignored = text.count("will be ignored") + text.count("ignored")
+    print(f"\n{problems} error(s) reported; "
+          f"{'entries marked IGNORED will NOT be imported' if ignored else 'nothing marked as ignored'}.")
+
+
 def import_site_maps(new_api, new_base_url, archive_path):
     headers = maps_api_headers(new_api)
     import_context_uuid = start_import(new_base_url, headers, archive_path)
@@ -473,7 +465,10 @@ def import_site_maps(new_api, new_base_url, archive_path):
     status = get_import_status(new_base_url, headers, import_context_uuid)
 
     print("\n--- Pre-import validation / preview ---")
-    print(json.dumps(status, indent=2, default=str) if isinstance(status, dict) else status)
+    if isinstance(status, dict):
+        summarise_preview(status)
+    else:
+        print(status)
     print("---------------------------------------")
 
     proceed = yes_no(
@@ -485,6 +480,19 @@ def import_site_maps(new_api, new_base_url, archive_path):
         return False
 
     perform_import(new_base_url, headers, import_context_uuid)
+
+    print("Waiting for import to finish ...")
+    final = {}
+    for _ in range(60):
+        time.sleep(POLL_INTERVAL_SECONDS)
+        final = get_import_status(new_base_url, headers, import_context_uuid)
+        if not isinstance(final, dict) or final.get("status") not in (
+            "DEFINED", "IN_PROGRESS", "STARTED", "PERFORMING", "RUNNING",
+        ):
+            break
+    print(f"\n--- Import result: {final.get('status') if isinstance(final, dict) else final} ---")
+    if isinstance(final, dict):
+        summarise_preview(final)
     return True
 
 
@@ -614,6 +622,58 @@ def export_only():
             break
 
 
+def migrate_site(old_api, new_api, old_host, new_host, old_sites, download_dir):
+    """One full cycle: pick -> destination path -> check -> export -> remap ->
+    import preview -> confirm. Returns True if the import was committed."""
+    wanted = os.environ.get("DNAC_SITE", "").strip()
+    if wanted:
+        matches = [x for x in old_sites if site_hierarchy_name(x) == wanted]
+        if not matches:
+            raise RuntimeError(f"DNAC_SITE '{wanted}' not found on the old system.")
+        chosen = matches[0]
+        print(f"\nSite to export: {wanted}  (from DNAC_SITE)")
+    else:
+        chosen = choose_site(old_sites, "Select the site to export maps from (old system):")
+    chosen_h = site_hierarchy_name(chosen)
+    if chosen_h == "Global":
+        print("Choose an area, building or floor, not the Global root.")
+        return False
+
+    dest_root = ask(
+        f"\nDestination path on the new system for '{chosen_h}':",
+        "DNAC_DEST",
+        default=chosen_h,
+    ).strip("/")
+    if not dest_root.startswith("Global"):
+        dest_root = "Global/" + dest_root
+
+    print("\nFetching site hierarchy from the new system ...")
+    new_sites = list_sites(new_api)
+    report, clean = check_destination(chosen, dest_root, old_sites, new_sites)
+    print(f"\n--- Path check: '{chosen_h}' -> '{dest_root}' ---")
+    for line in report:
+        print(line)
+    print("-" * 60)
+    if not clean:
+        print(
+            "\nImport cannot create areas, buildings or floors: anything MISSING "
+            "above will be ignored. Create them on the new system first."
+        )
+        if not yes_no("Continue anyway?"):
+            return False
+
+    archive = export_site_maps(old_api, f"https://{old_host}", chosen.get("id"), download_dir)
+    summarise_archive(archive)
+
+    if dest_root != chosen_h:
+        remapped = os.path.join(download_dir, "remapped.tar.gz")
+        remap_archive(archive, remapped, _split(chosen_h), _split(dest_root))
+        print(f"Remapped archive hierarchy: {chosen_h} -> {dest_root}")
+        archive = remapped
+
+    return import_site_maps(new_api, f"https://{new_host}", archive)
+
+
 def main():
     load_dotenv()
     if "--remap" in sys.argv:
@@ -626,18 +686,16 @@ def main():
         return import_only()
     if "--export-only" in sys.argv:
         return export_only()
+
     print("Catalyst Center map migration tool")
     print("===================================")
-
-    old_host = input("Old system host/IP (source, e.g. dnac-old.example.com): ").strip()
-    new_host = input("New system host/IP (destination): ").strip()
-    username = input("Username (used for both systems): ").strip()
-    password = getpass.getpass("Password (used for both systems): ")
+    old_host = ask("Old system host/IP (source):", "DNAC_HOST")
+    new_host = ask("New system host/IP (destination):", "DNAC_NEW_HOST", default=old_host)
+    username = ask("Username (used for both systems):", "DNAC_USER")
+    password = ask("Password (used for both systems):", "DNAC_PASS", secret=True)
 
     old_api = connect(old_host, username, password, "old system")
     new_api = connect(new_host, username, password, "new system")
-    old_base_url = f"https://{old_host}"
-    new_base_url = f"https://{new_host}"
 
     print("\nFetching site hierarchy from the old system ...")
     old_sites = list_sites(old_api)
@@ -646,50 +704,12 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="dnac_map_export_") as download_dir:
         while True:
-            chosen = choose_site(
-                old_sites, "Select the site to export maps from (old system):"
-            )
-            site_uuid = chosen.get("id")
-
-            print("\nFetching site hierarchy from the new system for cross-check ...")
-            new_sites = list_sites(new_api)
-            report, clean = compare_hierarchies(chosen, old_sites, new_sites)
-
-            print(f"\n--- Name cross-check: '{site_hierarchy_name(chosen)}' vs new system ---")
-            for line in report:
-                print(line)
-            print("--------------------------------------------------------------")
-
-            if not clean:
-                print(
-                    "\nSome buildings/floors did not cleanly match by name on the "
-                    "new system (see MISSING/AMBIGUOUS lines above)."
-                )
-                if not yes_no("Proceed with export/import anyway?"):
-                    print("Skipping this site.")
-                    if not yes_no("\nMigrate another site?", default_no=False):
-                        break
-                    continue
-            else:
-                print("All buildings/floors matched by name. Proceeding.")
-
             try:
-                archive_path = export_site_maps(old_api, old_base_url, site_uuid, download_dir)
-                summarise_archive(archive_path)
-                imported = import_site_maps(new_api, new_base_url, archive_path)
-                if imported:
-                    print(
-                        f"\nDone: maps for '{site_hierarchy_name(chosen)}' migrated."
-                    )
-                else:
-                    print(f"\nSkipped: import for '{site_hierarchy_name(chosen)}' was cancelled.")
+                done = migrate_site(old_api, new_api, old_host, new_host, old_sites, download_dir)
+                print("\nDone: import committed." if done else "\nNothing was imported.")
             except (RuntimeError, TimeoutError, ApiError, requests.RequestException) as exc:
                 print(f"\nERROR: {exc}")
                 print("You can retry this site or move on to the next one.")
-            finally:
-                if os.path.exists(archive_path) if 'archive_path' in locals() else False:
-                    os.remove(archive_path)
-
             if not yes_no("\nMigrate another site?", default_no=False):
                 break
 

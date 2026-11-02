@@ -9,20 +9,22 @@ each area, it is not a one-off migration script.
 
 ## What it does
 
-1. Prompts for the old (source) system host, the new (destination) system
-   host, and one username/password used against both.
-2. Lists the site hierarchy on the **old** system and lets you pick which
-   site (area, building, or floor) to export maps from. Picking an area
-   exports every building and floor nested underneath it in one archive.
-3. Fetches the site hierarchy on the **new** system and cross-checks every
-   building (and its floors) under the chosen scope by name, reporting
-   `[OK]` / `[MISSING]` / `[AMBIGUOUS]` before doing anything else.
-4. Exports the map archive from the old system and downloads it locally.
-5. Uploads it to the new system and starts an import.
-6. Prints the pre-import validation/preview and requires an explicit `yes`
-   before committing — a Map import fully replaces existing map data for
-   any matched site, so this is a deliberate gate, not a formality.
-7. Loops, asking whether to migrate another site.
+`python3 dnac_map_migrate.py` runs the whole migration for one site at a time:
+
+1. Takes hosts and credentials from `.env` (or prompts for them).
+2. Lists the site hierarchy on the **old** system; you pick the area,
+   building or floor to migrate (everything underneath it comes too).
+3. Asks for the **destination path** on the new system (Enter = same path).
+4. Checks every site under the selection **by full path** on the new
+   system and reports `[OK]` / `[MISSING]`. Import cannot create areas,
+   buildings or floors, so create anything missing first.
+5. Exports the map archive (floor plans, planned APs) from the old system.
+6. If the destination path differs, **remaps** the archive's hierarchy.
+7. Uploads to the new system and shows a readable pre-import preview.
+8. Requires an explicit `yes` (import replaces map data for matched
+   sites), commits, waits for completion and prints the final result,
+   including any per-entity errors.
+9. Loops for the next site.
 
 ## Requirements
 
@@ -84,8 +86,8 @@ python3 dnac_map_migrate.py --import-only OUT.tar.gz         # preview + yes gat
 
 ### Configuration (`.env`)
 
-The `--export-only` and `--import-only` modes read settings from a `.env`
-file next to the script, so they can run without prompts. Real environment
+The default flow and the `--export-only` / `--import-only` modes read settings
+from a `.env` file next to the script, so they can run with fewer prompts. Real environment
 variables override the file.
 
 ```bash
@@ -99,13 +101,13 @@ vi .env
 | `DNAC_NEW_HOST` | `--import-only` | Optional separate destination host/IP |
 | `DNAC_USER` | export, import | Username (same account used on both systems) |
 | `DNAC_PASS` | export, import | Password |
-| `DNAC_SITE` | `--export-only` | Exact hierarchy name to export without prompting, e.g. `Global/Australia/Western Australia/Perth/Cisco Perth Office`. Leave empty to pick from a list |
+| `DNAC_SITE` | default flow, `--export-only` | Exact hierarchy name to export without prompting, e.g. `Global/Australia/Western Australia/Perth/Cisco Perth Office`. Leave empty to pick from a list |
+| `DNAC_DEST` | default flow | Destination path on the new system (default: same as source) |
 | `DNAC_OUT` | `--export-only` | Directory for exported archives (default `map_export_out`) |
 
 If a value is missing the script prompts for it. `.env` and `map_export_out/`
 are gitignored: never commit credentials or customer map archives (this is a
-public repository). The interactive default mode (`python3 dnac_map_migrate.py`)
-does not read `.env` and still prompts for everything.
+public repository). The final `yes` before an import is always asked.
 
 ### 500-map export limit
 
