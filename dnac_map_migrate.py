@@ -286,7 +286,7 @@ def export_site_maps(api, base_url, site_uuid, download_dir):
     if resp is None:
         raise RuntimeError(
             "Every export request variant was rejected (see lines above). "
-            "Run probe_export2.py to check the maps service and site type."
+            "Check the maps service is up and the site UUID is valid."
         )
 
     # Documented: 200/202 with response.taskId + response.url; poll the Task API.
