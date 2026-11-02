@@ -97,8 +97,8 @@ vi .env
 
 | Variable | Used by | Purpose |
 |---|---|---|
-| `DNAC_HOST` | export, import | Catalyst Center host/IP (source for export; also the import target unless `DNAC_NEW_HOST` is set) |
-| `DNAC_NEW_HOST` | `--import-only` | Optional separate destination host/IP |
+| `DNAC_HOST` | all modes | Old (source) Catalyst Center host/IP |
+| `DNAC_NEW_HOST` | default flow, `--import-only` | New (destination) host/IP. Required; no longer defaults to the source |
 | `DNAC_USER` | export, import | Username (same account used on both systems) |
 | `DNAC_PASS` | export, import | Password |
 | `DNAC_SITE` | default flow, `--export-only` | Exact hierarchy name to export without prompting, e.g. `Global/Australia/Western Australia/Perth/Cisco Perth Office`. Leave empty to pick from a list |

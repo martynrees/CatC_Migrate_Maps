@@ -584,7 +584,7 @@ def import_only():
     """python3 dnac_map_migrate.py --import-only ARCHIVE  (preview + yes gate)."""
     load_dotenv()
     archive = sys.argv[sys.argv.index("--import-only") + 1]
-    host = os.environ.get("DNAC_NEW_HOST") or os.environ.get("DNAC_HOST") or input("Target host/IP: ").strip()
+    host = os.environ.get("DNAC_NEW_HOST") or input("Target (new system) host/IP: ").strip()
     user = os.environ.get("DNAC_USER") or input("Username: ").strip()
     pw = os.environ.get("DNAC_PASS") or getpass.getpass("Password: ")
     api = connect(host, user, pw, "target system")
@@ -690,7 +690,13 @@ def main():
     print("Catalyst Center map migration tool")
     print("===================================")
     old_host = ask("Old system host/IP (source):", "DNAC_HOST")
-    new_host = ask("New system host/IP (destination):", "DNAC_NEW_HOST", default=old_host)
+    new_host = ask("New system host/IP (destination):", "DNAC_NEW_HOST")
+    if not new_host:
+        sys.exit("A destination (new system) host/IP is required.")
+    if new_host == old_host and not yes_no(
+        "\nSource and destination are the SAME system. Continue?"
+    ):
+        sys.exit("Aborted.")
     username = ask("Username (used for both systems):", "DNAC_USER")
     password = ask("Password (used for both systems):", "DNAC_PASS", secret=True)
 
