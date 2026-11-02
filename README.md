@@ -82,7 +82,30 @@ python3 dnac_map_migrate.py --remap IN.tar.gz "Global/old/path" "Global/new/path
 python3 dnac_map_migrate.py --import-only OUT.tar.gz         # preview + yes gate
 ```
 
-Credentials come from a gitignored `.env` (see `.env.example`).
+### Configuration (`.env`)
+
+The `--export-only` and `--import-only` modes read settings from a `.env`
+file next to the script, so they can run without prompts. Real environment
+variables override the file.
+
+```bash
+cp .env.example .env
+vi .env
+```
+
+| Variable | Used by | Purpose |
+|---|---|---|
+| `DNAC_HOST` | export, import | Catalyst Center host/IP (source for export; also the import target unless `DNAC_NEW_HOST` is set) |
+| `DNAC_NEW_HOST` | `--import-only` | Optional separate destination host/IP |
+| `DNAC_USER` | export, import | Username (same account used on both systems) |
+| `DNAC_PASS` | export, import | Password |
+| `DNAC_SITE` | `--export-only` | Exact hierarchy name to export without prompting, e.g. `Global/Australia/Western Australia/Perth/Cisco Perth Office`. Leave empty to pick from a list |
+| `DNAC_OUT` | `--export-only` | Directory for exported archives (default `map_export_out`) |
+
+If a value is missing the script prompts for it. `.env` and `map_export_out/`
+are gitignored: never commit credentials or customer map archives (this is a
+public repository). The interactive default mode (`python3 dnac_map_migrate.py`)
+does not read `.env` and still prompts for everything.
 
 ### 500-map export limit
 
