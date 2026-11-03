@@ -488,9 +488,18 @@ def summarise_preview(status):
 
     walk(status)
     text = json.dumps(status, default=str).lower()
+    removals = len(re.findall(r"managed ap '[^']*' will be removed", text))
     ignored = text.count("will be ignored") + text.count("ignored")
     print(f"\n{problems} error(s) reported; "
           f"{'entries marked IGNORED will NOT be imported' if ignored else 'nothing marked as ignored'}.")
+    if removals:
+        print(
+            f"\n!!! WARNING: the server says {removals} MANAGED AP(s) already on these floors "
+            "'will be removed'.\n"
+            "!!! What that does to their site assignment is NOT verified. Do not proceed "
+            "on production\n!!! data until it has been tested on a single floor."
+        )
+    return removals
 
 
 def import_site_maps(new_api, new_base_url, archive_path):
@@ -502,11 +511,21 @@ def import_site_maps(new_api, new_base_url, archive_path):
     status = get_import_status(new_base_url, headers, import_context_uuid)
 
     print("\n--- Pre-import validation / preview ---")
+    removals = 0
     if isinstance(status, dict):
-        summarise_preview(status)
+        removals = summarise_preview(status)
     else:
         print(status)
     print("---------------------------------------")
+
+    if removals:
+        typed = input(
+            f"\n{removals} managed AP(s) are listed as 'will be removed'. "
+            "Type REMOVE APS to continue anyway, anything else cancels: "
+        ).strip()
+        if typed != "REMOVE APS":
+            cancel_import(new_base_url, headers, import_context_uuid)
+            return False
 
     proceed = yes_no(
         "\nThis will REPLACE existing map data for any matched site on the new "
