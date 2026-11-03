@@ -36,6 +36,7 @@ working for every subsequent site you migrate.
 import getpass
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -150,29 +151,58 @@ def sites_in_scope(chosen, all_sites):
     ]
 
 
+def _site_attr(site, key):
+    """Look up an attribute across every additionalInfo entry (case-insens.)."""
+    for info in site.get("additionalInfo") or []:
+        for k, v in (info.get("attributes") or {}).items():
+            if k.lower() == key.lower() and v not in (None, ""):
+                return v
+    return None
+
+
+def is_floor(site, old_by_id):
+    """A floor is typed 'floor', or is any child of a building (types are
+    not always populated in the site listing)."""
+    if site_type(site) == "floor":
+        return True
+    parent = old_by_id.get(site.get("parentId"))
+    return bool(parent) and site_type(parent) == "building"
+
+
 def check_destination(chosen, dest_root, old_sites, new_sites):
     """Check, by FULL hierarchy path, that every site under the chosen node
-    will have a counterpart on the new system once the subtree is placed at
-    dest_root. Import matches on the full path and cannot create areas,
-    buildings or floors, so anything missing is silently ignored by import.
-    Returns (report_lines, clean)."""
+    has a counterpart on the new system once the subtree is placed at
+    dest_root. Import matches on the full path and cannot create sites, so
+    missing FLOORS (whose parent building exists) are returned as creatable;
+    anything else missing is blocked and import will ignore it.
+    Returns (report_lines, creatable, blocked) where creatable is a list of
+    (dest_path, rf_model_or_None) and blocked a list of dest paths."""
     chosen_h = site_hierarchy_name(chosen)
     new_by_path = {site_hierarchy_name(x): x for x in new_sites}
     new_lower = {k.lower(): k for k in new_by_path}
-    report, missing, ok = [], 0, 0
+    old_by_id = {x.get("id"): x for x in old_sites}
+    report, creatable, blocked, ok = [], [], [], 0
     for site in sorted(sites_in_scope(chosen, old_sites), key=site_hierarchy_name):
         old_h = site_hierarchy_name(site)
         dest_h = dest_root + old_h[len(chosen_h):]
         if dest_h in new_by_path:
             ok += 1
             report.append(f"[OK]       {dest_h}")
+            continue
+        hint = new_lower.get(dest_h.lower())
+        note = f"  (differs only by case from '{hint}')" if hint else ""
+        parent_h = dest_h.rsplit("/", 1)[0]
+        if is_floor(site, old_by_id) and parent_h in new_by_path and not hint:
+            creatable.append((dest_h, _site_attr(site, "rfModel")))
+            report.append(f"[CREATE]   {dest_h}  (floor missing, will be created)")
         else:
-            missing += 1
-            hint = new_lower.get(dest_h.lower())
-            note = f"  (differs only by case from '{hint}')" if hint else ""
+            blocked.append(dest_h)
             report.append(f"[MISSING]  {dest_h}{note}")
-    report.append(f"{ok} found, {missing} missing on the new system.")
-    return report, missing == 0
+    report.append(
+        f"{ok} found, {len(creatable)} floor(s) to create, {len(blocked)} missing "
+        "(areas/buildings must already exist)."
+    )
+    return report, creatable, blocked
 
 
 def ask(prompt, env_key=None, secret=False, default=None):
@@ -515,6 +545,91 @@ def _find_path(root, path):
     return node
 
 
+def _load_archive(src):
+    """Return (tar members with data, parsed Maps XML root)."""
+    import tarfile
+    import xml.etree.ElementTree as ET
+
+    ET.register_namespace("", _NS)
+    ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
+    with tarfile.open(src) as tf:
+        members = [(m, tf.extractfile(m).read() if m.isfile() else None) for m in tf.getmembers()]
+    xml_bytes = next(d for m, d in members if m.name == MAPS_XML)
+    return members, ET.fromstring(xml_bytes)
+
+
+def _save_archive_xml(dst, members, root):
+    """Write members back as a tar.gz with the (modified) Maps XML."""
+    import io
+    import tarfile
+    import xml.etree.ElementTree as ET
+
+    out_xml = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+    with tarfile.open(dst, "w:gz") as tf:
+        for member, data in members:
+            if member.name == MAPS_XML:
+                member.size = len(out_xml)
+                tf.addfile(member, io.BytesIO(out_xml))
+            elif data is not None:
+                tf.addfile(member, io.BytesIO(data))
+            else:
+                tf.addfile(member)
+    return dst
+
+
+def _local(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+# Floor children seen in real exports. PlannedAp is the only AP element
+# verified; real (assigned) AP element names have not been seen, so anything
+# that looks like an AP is removed and anything unrecognised is reported.
+_KNOWN_FLOOR_CHILDREN = {"Obstacles", "Region", "Dimension", "ImageInfo"}
+_AP_TAG = re.compile(r"^(planned)?(access ?point|ap)s?$", re.IGNORECASE)
+
+
+def strip_aps(src, dst):
+    """Remove all AP placements from an exported archive. The old system's
+    APs are being replaced, so their placements are useless on the new
+    system; floor plans, dimensions and obstacles are untouched. Returns
+    (removed_count, unrecognised_floor_child_tags)."""
+    members, root = _load_archive(src)
+    removed, unknown = 0, set()
+    for floor in root.iter(f"{{{_NS}}}Floor"):
+        for child in list(floor):
+            name = _local(child.tag)
+            if _AP_TAG.match(name):
+                floor.remove(child)
+                removed += 1
+            elif name not in _KNOWN_FLOOR_CHILDREN:
+                unknown.add(name)
+    _save_archive_xml(dst, members, root)
+    return removed, sorted(unknown)
+
+
+def floors_in_archive(src):
+    """{ 'Global/Area/Building/Floor': {level, length, width, height} } for
+    every floor in the archive, as stored in the XML (distances in feet)."""
+    _, root = _load_archive(src)
+    floors = {}
+
+    def walk(node, names):
+        for child in node:
+            if child.tag in _HIER_TAGS:
+                path = names + [child.get("name")]
+                if child.tag.endswith("Floor"):
+                    dim = child.find(f"{{{_NS}}}Dimension")
+                    floors["Global/" + "/".join(path)] = {
+                        "level": child.get("level"),
+                        **(dict(dim.attrib) if dim is not None else {}),
+                    }
+                else:
+                    walk(child, path)
+
+    walk(root.find(f"{{{_NS}}}Maps"), [])
+    return floors
+
+
 def remap_archive(src, dst, old_path, new_path):
     """Rewrite the hierarchy nesting in an exported archive so import lands
     the subtree at old_path under new_path instead. Paths are lists of names
@@ -522,17 +637,9 @@ def remap_archive(src, dst, old_path, new_path):
     areas on the new path are added as Site elements; the last name of
     new_path renames the moved node."""
     import copy
-    import io
-    import tarfile
     import xml.etree.ElementTree as ET
 
-    ET.register_namespace("", _NS)
-    ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
-
-    with tarfile.open(src) as tf:
-        members = [(m, tf.extractfile(m).read() if m.isfile() else None) for m in tf.getmembers()]
-    xml_bytes = next(d for m, d in members if m.name == MAPS_XML)
-    root = ET.fromstring(xml_bytes)
+    members, root = _load_archive(src)
 
     moved = _find_path(root, old_path)
     moved_copy = copy.deepcopy(moved)
@@ -560,17 +667,7 @@ def remap_archive(src, dst, old_path, new_path):
             node = ET.SubElement(node, f"{{{_NS}}}{tag}", {"name": name})
     node.append(moved_copy)
 
-    out_xml = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
-    with tarfile.open(dst, "w:gz") as tf:
-        for member, data in members:
-            if member.name == MAPS_XML:
-                member.size = len(out_xml)
-                tf.addfile(member, io.BytesIO(out_xml))
-            elif data is not None:
-                tf.addfile(member, io.BytesIO(data))
-            else:
-                tf.addfile(member)
-    return dst
+    return _save_archive_xml(dst, members, root)
 
 
 def _split(path):
@@ -622,6 +719,62 @@ def export_only():
             break
 
 
+RF_MODELS = (
+    "Cubes And Walled Offices",
+    "Drywall Office Only",
+    "Indoor High Ceiling",
+    "Outdoor Open Space",
+)
+
+
+def create_missing_floors(new_api, creatable, archive_floors):
+    """Create floors that exist in the old system but not the new one, using
+    the size and level recorded in the archive (feet). The import that
+    follows fills in the floor plan. Returns the list of paths that exist on
+    the new system afterwards."""
+    ready = []
+    for dest_h, rf_model in creatable:
+        info = archive_floors.get(dest_h) or {}
+        try:
+            dims = {k: float(info[k]) for k in ("width", "length", "height")}
+        except (KeyError, TypeError, ValueError):
+            print(f"  [SKIP] {dest_h}: no usable size in the archive, cannot create")
+            continue
+        parent, name = dest_h.rsplit("/", 1)
+        floor = {
+            "name": name,
+            "parentName": parent,
+            "rfModel": rf_model if rf_model in RF_MODELS else RF_MODELS[0],
+            **dims,
+        }
+        level = str(info.get("level") or "").lstrip("-")
+        if level.isdigit():
+            floor["floorNumber"] = int(info["level"])
+        try:
+            new_api.sites.create_site(
+                type="floor",
+                site={"floor": floor},
+                headers={"__runsync": True, "__timeout": 60, "__persistbapioutput": True},
+            )
+        except ApiError as exc:
+            print(f"  [FAIL] {dest_h}: {exc}")
+            continue
+        for _ in range(10):
+            try:
+                found = new_api.sites.get_site(name=dest_h)
+                found = found.response if hasattr(found, "response") else found
+            except ApiError:
+                found = None
+            if found:
+                print(f"  [CREATED] {dest_h}")
+                ready.append(dest_h)
+                break
+            time.sleep(3)
+        else:
+            print(f"  [FAIL] {dest_h}: create call returned but the floor never appeared")
+    return ready
+
+
 def migrate_site(old_api, new_api, old_host, new_host, old_sites, download_dir):
     """One full cycle: pick -> destination path -> check -> export -> remap ->
     import preview -> confirm. Returns True if the import was committed."""
@@ -649,15 +802,15 @@ def migrate_site(old_api, new_api, old_host, new_host, old_sites, download_dir):
 
     print("\nFetching site hierarchy from the new system ...")
     new_sites = list_sites(new_api)
-    report, clean = check_destination(chosen, dest_root, old_sites, new_sites)
+    report, creatable, blocked = check_destination(chosen, dest_root, old_sites, new_sites)
     print(f"\n--- Path check: '{chosen_h}' -> '{dest_root}' ---")
     for line in report:
         print(line)
     print("-" * 60)
-    if not clean:
+    if blocked:
         print(
-            "\nImport cannot create areas, buildings or floors: anything MISSING "
-            "above will be ignored. Create them on the new system first."
+            "\nImport cannot create areas or buildings: anything MISSING above "
+            "will be ignored. Create them on the new system first."
         )
         if not yes_no("Continue anyway?"):
             return False
@@ -665,11 +818,32 @@ def migrate_site(old_api, new_api, old_host, new_host, old_sites, download_dir):
     archive = export_site_maps(old_api, f"https://{old_host}", chosen.get("id"), download_dir)
     summarise_archive(archive)
 
+    # AP placements from the old system are useless on the new one (the APs
+    # are being replaced), so drop them from the archive before import.
+    if os.environ.get("DNAC_KEEP_APS", "").lower() in ("1", "true", "yes"):
+        print("DNAC_KEEP_APS set: AP placements kept in the archive.")
+    else:
+        stripped = os.path.join(download_dir, "no_aps.tar.gz")
+        removed, unknown = strip_aps(archive, stripped)
+        archive = stripped
+        print(f"Removed {removed} AP placement(s) from the archive.")
+        if unknown:
+            print(f"  Note: unrecognised floor elements left in place: {', '.join(unknown)}")
+
     if dest_root != chosen_h:
         remapped = os.path.join(download_dir, "remapped.tar.gz")
         remap_archive(archive, remapped, _split(chosen_h), _split(dest_root))
         print(f"Remapped archive hierarchy: {chosen_h} -> {dest_root}")
         archive = remapped
+
+    if creatable:
+        print(f"\n{len(creatable)} floor(s) exist on the old system but not the new one:")
+        for dest_h, _ in creatable:
+            print(f"   {dest_h}")
+        if yes_no("Create these floors on the new system now?", default_no=False):
+            create_missing_floors(new_api, creatable, floors_in_archive(archive))
+        else:
+            print("Not creating them: import will ignore those floors.")
 
     return import_site_maps(new_api, f"https://{new_host}", archive)
 

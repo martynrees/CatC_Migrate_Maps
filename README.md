@@ -16,15 +16,21 @@ each area, it is not a one-off migration script.
    building or floor to migrate (everything underneath it comes too).
 3. Asks for the **destination path** on the new system (Enter = same path).
 4. Checks every site under the selection **by full path** on the new
-   system and reports `[OK]` / `[MISSING]`. Import cannot create areas,
-   buildings or floors, so create anything missing first.
-5. Exports the map archive (floor plans, planned APs) from the old system.
-6. If the destination path differs, **remaps** the archive's hierarchy.
-7. Uploads to the new system and shows a readable pre-import preview.
-8. Requires an explicit `yes` (import replaces map data for matched
+   system and reports `[OK]`, `[CREATE]` (floor missing but its building
+   exists) or `[MISSING]` (area/building missing).
+5. Exports the map archive (floor plans, dimensions) from the old system.
+6. **Removes AP placements** from the archive: the old APs are being
+   replaced, so placing them on the new system is pointless. Floor plans
+   are kept. Set `DNAC_KEEP_APS=true` to keep them.
+7. If the destination path differs, **remaps** the archive's hierarchy.
+8. **Creates missing floors** on the new system (after a Y/n prompt) using
+   the size and level from the archive, then uploads and shows a readable
+   pre-import preview.
+9. Requires an explicit `yes` (import replaces map data for matched
    sites), commits, waits for completion and prints the final result,
    including any per-entity errors.
-9. Loops for the next site.
+10. Loops for the next site.
+
 
 ## Requirements
 
@@ -72,8 +78,9 @@ repeat for the next area as needed.
 - **Matching is by full hierarchy path** stored in the XML as nested
   `Site > Building > Floor` names (without `Global`), not by leaf name alone.
 - **Import cannot create areas, buildings or floors.** Anything missing on the
-  target is reported "doesn't exist ... will be ignored". Create the target
-  hierarchy (exact names) first.
+  target is reported "doesn't exist ... will be ignored". The tool creates
+  missing **floors** itself (Create Site API) when their building exists;
+  areas and buildings must be created first, with exact names.
 - **Remap:** `--remap` rewrites the XML nesting so an exported subtree lands
   on a different existing path. Preview confirmed on an existing floor;
   a committed import has not yet been tested.
@@ -103,6 +110,7 @@ vi .env
 | `DNAC_PASS` | export, import | Password |
 | `DNAC_SITE` | default flow, `--export-only` | Exact hierarchy name to export without prompting, e.g. `Global/Australia/Western Australia/Perth/Cisco Perth Office`. Leave empty to pick from a list |
 | `DNAC_DEST` | default flow | Destination path on the new system (default: same as source) |
+| `DNAC_KEEP_APS` | default flow | Set `true` to keep AP placements in the archive (default: removed) |
 | `DNAC_OUT` | `--export-only` | Directory for exported archives (default `map_export_out`) |
 
 If a value is missing the script prompts for it. `.env` and `map_export_out/`
