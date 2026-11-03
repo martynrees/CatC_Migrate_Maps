@@ -79,7 +79,14 @@ def connect(host, username, password, label):
         )
     except ApiError as exc:
         sys.exit(f"Could not authenticate to {label} ({host}): {exc}")
-    print(f"Connected to {label}.")
+    release = ""
+    try:
+        summary = api.platform.release_summary()
+        summary = summary.response if hasattr(summary, "response") else summary
+        release = f" (Catalyst Center {summary.get('installedVersion') or summary.get('releaseVersion') or '?'})"
+    except Exception:  # informational only
+        pass
+    print(f"Connected to {label}{release}.")
     return api
 
 
@@ -727,11 +734,39 @@ RF_MODELS = (
 )
 
 
+def _error_text(exc):
+    """Status plus the server's own message for an SDK ApiError."""
+    details = getattr(exc, "details", None)
+    body = json.dumps(details) if details else getattr(getattr(exc, "response", None), "text", "")
+    return f"HTTP {getattr(exc, 'status_code', '?')}: {(body or str(exc))[:400]}"
+
+
+def _floor_exists(new_api, dest_h, tries=5):
+    for _ in range(tries):
+        try:
+            found = new_api.sites.get_site(name=dest_h)
+            found = found.response if hasattr(found, "response") else found
+        except ApiError:
+            found = None
+        if found:
+            return True
+        time.sleep(3)
+    return False
+
+
+# Create Site is documented as sync (__runsync) or async; releases differ in
+# which they accept, so try sync first and fall back to a plain async call.
+_CREATE_HEADER_VARIANTS = [
+    ("sync", {"__runsync": True, "__timeout": 60, "__persistbapioutput": True}),
+    ("async", None),
+]
+
+
 def create_missing_floors(new_api, creatable, archive_floors):
     """Create floors that exist in the old system but not the new one, using
     the size and level recorded in the archive (feet). The import that
     follows fills in the floor plan. Returns the list of paths that exist on
-    the new system afterwards."""
+    the new system afterwards; failures print the server's own error."""
     ready = []
     for dest_h, rf_model in creatable:
         info = archive_floors.get(dest_h) or {}
@@ -750,28 +785,20 @@ def create_missing_floors(new_api, creatable, archive_floors):
         level = str(info.get("level") or "").lstrip("-")
         if level.isdigit():
             floor["floorNumber"] = int(info["level"])
-        try:
-            new_api.sites.create_site(
-                type="floor",
-                site={"floor": floor},
-                headers={"__runsync": True, "__timeout": 60, "__persistbapioutput": True},
-            )
-        except ApiError as exc:
-            print(f"  [FAIL] {dest_h}: {exc}")
-            continue
-        for _ in range(10):
+
+        created = False
+        for label, headers in _CREATE_HEADER_VARIANTS:
             try:
-                found = new_api.sites.get_site(name=dest_h)
-                found = found.response if hasattr(found, "response") else found
-            except ApiError:
-                found = None
-            if found:
-                print(f"  [CREATED] {dest_h}")
+                new_api.sites.create_site(type="floor", site={"floor": floor}, headers=headers)
+            except ApiError as exc:
+                print(f"  [{label}] create {dest_h} -> {_error_text(exc)}")
+            if _floor_exists(new_api, dest_h):
+                print(f"  [CREATED] {dest_h}  (via {label} request)")
                 ready.append(dest_h)
+                created = True
                 break
-            time.sleep(3)
-        else:
-            print(f"  [FAIL] {dest_h}: create call returned but the floor never appeared")
+        if not created:
+            print(f"  [FAIL] {dest_h}: floor not created. Request body was: {json.dumps(floor)}")
     return ready
 
 
@@ -841,7 +868,13 @@ def migrate_site(old_api, new_api, old_host, new_host, old_sites, download_dir):
         for dest_h, _ in creatable:
             print(f"   {dest_h}")
         if yes_no("Create these floors on the new system now?", default_no=False):
-            create_missing_floors(new_api, creatable, floors_in_archive(archive))
+            made = create_missing_floors(new_api, creatable, floors_in_archive(archive))
+            failed = [d for d, _ in creatable if d not in made]
+            if failed and not yes_no(
+                f"{len(failed)} floor(s) could not be created and will be ignored "
+                "by import. Continue with the rest?"
+            ):
+                return False
         else:
             print("Not creating them: import will ignore those floors.")
 
