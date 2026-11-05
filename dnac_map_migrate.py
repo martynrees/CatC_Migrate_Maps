@@ -494,10 +494,9 @@ def summarise_preview(status):
           f"{'entries marked IGNORED will NOT be imported' if ignored else 'nothing marked as ignored'}.")
     if removals:
         print(
-            f"\n!!! WARNING: the server says {removals} MANAGED AP(s) already on these floors "
-            "'will be removed'.\n"
-            "!!! What that does to their site assignment is NOT verified. Do not proceed "
-            "on production\n!!! data until it has been tested on a single floor."
+            f"\nNote: {removals} managed AP(s) are listed as 'will be removed'. Tested on a "
+            "live floor: this clears the AP from the map only; the AP stays assigned in "
+            "Inventory and stays up."
         )
     return removals
 
@@ -517,15 +516,6 @@ def import_site_maps(new_api, new_base_url, archive_path):
     else:
         print(status)
     print("---------------------------------------")
-
-    if removals:
-        typed = input(
-            f"\n{removals} managed AP(s) are listed as 'will be removed'. "
-            "Type REMOVE APS to continue anyway, anything else cancels: "
-        ).strip()
-        if typed != "REMOVE APS":
-            cancel_import(new_base_url, headers, import_context_uuid)
-            return False
 
     proceed = yes_no(
         "\nThis will REPLACE existing map data for any matched site on the new "

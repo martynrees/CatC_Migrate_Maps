@@ -81,6 +81,10 @@ repeat for the next area as needed.
   target is reported "doesn't exist ... will be ignored". The tool creates
   missing **floors** itself (Create Site API) when their building exists;
   areas and buildings must be created first, with exact names.
+- **Managed APs already on a floor:** the preview says `Managed AP '...' will be removed` and the
+  result says `got removed`. Tested on one live floor (1 AP): this clears the AP from the map only;
+  its site assignment, provisioning and reachability were unchanged. Tested on a single AP only, so
+  canary a floor with several APs before a bulk run.
 - **Remap:** `--remap` rewrites the XML nesting so an exported subtree lands
   on a different existing path. Preview confirmed on an existing floor;
   a committed import has not yet been tested.
